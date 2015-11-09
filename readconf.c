@@ -130,6 +130,7 @@
 typedef enum {
 	oBadOption,
 	oHost, oMatch,
+	oInclude, oIncludeIfExists,
 	oForwardAgent, oForwardX11, oForwardX11Trusted, oForwardX11Timeout,
 	oGatewayPorts, oExitOnForwardFailure,
 	oPasswordAuthentication, oRSAAuthentication,
@@ -280,6 +281,8 @@ static struct {
 	{ "hostbasedkeytypes", oHostbasedKeyTypes },
 	{ "pubkeyacceptedkeytypes", oPubkeyAcceptedKeyTypes },
 	{ "ignoreunknown", oIgnoreUnknown },
+	{ "include", oInclude },
+	{ "includeifexists", oIncludeIfExists },
 
 	{ NULL, oBadOption }
 };
@@ -769,6 +772,7 @@ process_config_line(Options *options, struct passwd *pw, const char *host,
 	char **cpptr, fwdarg[256];
 	u_int i, *uintptr, max_entries = 0;
 	int negated, opcode, *intptr, value, value2, cmdline = 0;
+	int skip_non_existing_include = 0;
 	LogLevel *log_level_ptr;
 	long long val64;
 	size_t len;
@@ -1532,6 +1536,31 @@ parse_keytypes:
 	case oPubkeyAcceptedKeyTypes:
 		charptr = &options->pubkey_key_types;
 		goto parse_keytypes;
+
+	case oInclude:
+process_include:
+		arg = strdelim(&s);
+		if (!arg || *arg == '\0')
+			fatal("%.200s line %d: Missing argument.",
+			    filename, linenum);
+		if (*activep) {
+			debug("%s line %d: Recursing to included config %s",
+			    filename, linenum, arg);
+			if (!read_config_file(arg, pw, host, original_host, options, flags)) {
+				if (skip_non_existing_include) {
+					debug("%s line %d: Cannot read included file \"%s\". Skipping...",
+					    filename, linenum, arg);
+				} else {
+					fatal("Can't open user config file \"%s\": %s",
+					    arg, strerror(errno));
+				}
+			}
+		}
+		return 0;
+
+	case oIncludeIfExists:
+		skip_non_existing_include = 1;
+		goto process_include;
 
 	case oDeprecated:
 		debug("%s line %d: Deprecated option \"%s\"",
