@@ -62,6 +62,8 @@
 #include "myproposal.h"
 #include "digest.h"
 
+#include <openbsd-compat/sys-tree.h>
+
 /* Format of the configuration file:
 
    # Configuration data is parsed as follows:
@@ -125,11 +127,24 @@
 
 */
 
+/* RBTree for includes set implementation */
+
+struct included_path_node {
+	char* path;
+	RB_ENTRY(included_path_node) tree_entry;
+};
+static int included_path_node_cmp(struct included_path_node *a, struct included_path_node *b);
+RB_HEAD(included_paths_tree, included_path_node);
+RB_GENERATE_STATIC(included_paths_tree, included_path_node, tree_entry, included_path_node_cmp);
+
+struct included_paths_tree USED_PATHS;
+
 /* Keyword tokens. */
 
 typedef enum {
 	oBadOption,
 	oHost, oMatch,
+	oInclude, oIncludeIfExists,
 	oForwardAgent, oForwardX11, oForwardX11Trusted, oForwardX11Timeout,
 	oGatewayPorts, oExitOnForwardFailure,
 	oPasswordAuthentication, oRSAAuthentication,
@@ -280,9 +295,18 @@ static struct {
 	{ "hostbasedkeytypes", oHostbasedKeyTypes },
 	{ "pubkeyacceptedkeytypes", oPubkeyAcceptedKeyTypes },
 	{ "ignoreunknown", oIgnoreUnknown },
+	{ "include", oInclude },
+	{ "includeifexists", oIncludeIfExists },
 
 	{ NULL, oBadOption }
 };
+
+
+static int
+included_path_node_cmp(struct included_path_node *a, struct included_path_node *b)
+{
+	return strcmp(a->path, b->path);
+}
 
 /*
  * Adds a local TCP/IP port forward to options.  Never returns if there is an
@@ -769,6 +793,7 @@ process_config_line(Options *options, struct passwd *pw, const char *host,
 	char **cpptr, fwdarg[256];
 	u_int i, *uintptr, max_entries = 0;
 	int negated, opcode, *intptr, value, value2, cmdline = 0;
+	int skip_non_existing_include = 0;
 	LogLevel *log_level_ptr;
 	long long val64;
 	size_t len;
@@ -1533,6 +1558,30 @@ parse_keytypes:
 		charptr = &options->pubkey_key_types;
 		goto parse_keytypes;
 
+	case oIncludeIfExists:
+		skip_non_existing_include = 1;
+		/* FALLTHROUGH */
+
+	case oInclude:
+		arg = strdelim(&s);
+		if (!arg || *arg == '\0')
+			fatal("%.200s line %d: Missing argument.",
+			    filename, linenum);
+		if (*activep) {
+			debug("%s line %d: Recursing to included config %s",
+			    filename, linenum, arg);
+			if (!read_config_file(arg, pw, host, original_host, options, flags)) {
+				if (skip_non_existing_include) {
+					debug("%s line %d: Cannot read included file \"%s\". Skipping...",
+					    filename, linenum, arg);
+				} else {
+					fatal("Can't open user config file \"%s\": %s",
+					    arg, strerror(errno));
+				}
+			}
+		}
+		return 0;
+
 	case oDeprecated:
 		debug("%s line %d: Deprecated option \"%s\"",
 		    filename, linenum, keyword);
@@ -1566,6 +1615,7 @@ int
 read_config_file(const char *filename, struct passwd *pw, const char *host,
     const char *original_host, Options *options, int flags)
 {
+	struct included_path_node new_cfg_node;
 	FILE *f;
 	char line[1024];
 	int active, linenum;
@@ -1573,6 +1623,19 @@ read_config_file(const char *filename, struct passwd *pw, const char *host,
 
 	if ((f = fopen(filename, "r")) == NULL)
 		return 0;
+
+	// Initialize new_cfg_node and try to find it in USED_PATH set
+	memset(&new_cfg_node, 0, sizeof(new_cfg_node));
+	new_cfg_node.path = (char*)filename;
+
+	if (RB_FIND(included_paths_tree, &USED_PATHS, &new_cfg_node)) {
+		fclose(f);
+		fatal("Found cycle in includes! File '%s' is included twice!", filename);
+	}
+	// File has been never seen before in include stack, so add it to USED_PATH set
+	new_cfg_node.path = malloc(strlen(filename) + 1);
+	strcpy(new_cfg_node.path, filename);
+	RB_INSERT(included_paths_tree, &USED_PATHS, &new_cfg_node);
 
 	if (flags & SSHCONF_CHECKPERM) {
 		struct stat sb;
@@ -1600,6 +1663,8 @@ read_config_file(const char *filename, struct passwd *pw, const char *host,
 			bad_options++;
 	}
 	fclose(f);
+	RB_REMOVE(included_paths_tree, &USED_PATHS, &new_cfg_node);
+	free(new_cfg_node.path);
 	if (bad_options > 0)
 		fatal("%s: terminating, %d bad configuration options",
 		    filename, bad_options);
@@ -1715,6 +1780,7 @@ initialize_options(Options * options)
 	options->update_hostkeys = -1;
 	options->hostbased_key_types = NULL;
 	options->pubkey_key_types = NULL;
+	RB_INIT(&USED_PATHS);
 }
 
 /*
